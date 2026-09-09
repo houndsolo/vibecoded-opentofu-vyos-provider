@@ -1,0 +1,42 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+      - run: test -z "$(gofmt -l .)"
+      - run: go test -race ./...
+      - run: go vet ./...
+  cli:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cli: [tofu, terraform]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+      - uses: opentofu/setup-opentofu@v1
+        if: matrix.cli == 'tofu'
+        with:
+          tofu_version: 1.12.6
+          tofu_wrapper: false
+      - uses: hashicorp/setup-terraform@v3
+        if: matrix.cli == 'terraform'
+        with:
+          terraform_version: 1.16.2
+          terraform_wrapper: false
+      - run: make build
+      - run: python3 scripts/test_cli.py --cli ${{ matrix.cli }}
