@@ -220,3 +220,103 @@ func TestCredentialLogging(t *testing.T) {
 		t.Fatal("credential logging is unsafe")
 	}
 }
+
+func TestUnknownProviderEndpointAllowsKnownResource(t *testing.T) {
+	f := newFakeAPI(t, dummy(map[string]any{"mtu": "1400"}), map[string]any{})
+	r := &commandsResource{settings: configuredSettings(t, providerModel{
+		Endpoint: types.StringUnknown(), APIKey: types.StringValue("test-api-key"),
+		PlanTimeout: types.StringUnknown(),
+	})}
+	state := createFixture(t, r, testModel(f.server.URL, "set interfaces dummy dum99 mtu 1400"))
+	read := resource.ReadResponse{State: state}
+	r.Read(context.Background(), resource.ReadRequest{State: state}, &read)
+	if read.Diagnostics.HasError() || !readModel(t, read.State).InSync.ValueBool() {
+		t.Fatalf("unknown default blocked refresh: %v", read.Diagnostics)
+	}
+	destroy := resource.DeleteResponse{State: state}
+	r.Delete(context.Background(), resource.DeleteRequest{State: state}, &destroy)
+	if destroy.Diagnostics.HasError() || !destroy.State.Raw.IsNull() {
+		t.Fatalf("unknown default blocked stored-target destroy: %v", destroy.Diagnostics)
+	}
+}
+
+func TestModifyPlanEndpointChanges(t *testing.T) {
+	for _, tc := range []struct {
+		name                                                string
+		old, configured, providerEndpoint                   string
+		unknownDefault, wantReplace, wantUnknown, wantError bool
+	}{
+		{name: "cosmetic", old: "https://ROUTER:443/", configured: "https://router"},
+		{name: "new target", old: "https://old", configured: "https://new", wantReplace: true},
+		{name: "new proxy route", old: "https://router/leaf%2F1", configured: "https://router/leaf/1", wantReplace: true},
+		{name: "inherited default", providerEndpoint: "https://router"},
+		{name: "missing endpoint", wantError: true},
+		{name: "unknown inherited default", unknownDefault: true, wantUnknown: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := resourceFixture(tc.providerEndpoint)
+			r.settings.endpointUnknown = tc.unknownDefault
+			// This test checks planning without needing a reachable router.
+			r.settings.planTimeout = time.Nanosecond
+			model := testModel(tc.configured, "set system host-name leaf")
+			model.ID = types.StringValue("stable")
+			if tc.configured == "" {
+				model.Endpoint = types.StringNull()
+			}
+			ps := modelState(t, model)
+			old := nullState()
+			if tc.old != "" {
+				prior := model
+				prior.Endpoint = types.StringValue(tc.old)
+				old = modelState(t, prior)
+			}
+			req := resource.ModifyPlanRequest{State: old, Config: tfsdk.Config{Schema: ps.Schema, Raw: ps.Raw}, Plan: tfsdk.Plan{Schema: ps.Schema, Raw: ps.Raw}}
+			resp := resource.ModifyPlanResponse{Plan: req.Plan}
+			r.ModifyPlan(context.Background(), req, &resp)
+			if resp.Diagnostics.HasError() != tc.wantError || (len(resp.RequiresReplace) > 0) != tc.wantReplace {
+				t.Fatalf("replacement=%v diagnostics=%v", resp.RequiresReplace, resp.Diagnostics)
+			}
+			if tc.wantError {
+				return
+			}
+			planned := readModel(t, tfsdk.State{Schema: ps.Schema, Raw: resp.Plan.Raw})
+			if planned.Endpoint.IsUnknown() != tc.wantUnknown || !planned.ID.Equal(model.ID) {
+				t.Fatal("endpoint knowledge or resource ID changed")
+			}
+			if tc.configured != "" && planned.Endpoint.ValueString() != tc.configured {
+				t.Fatal("plan changed a configured attribute instead of preserving its literal value")
+			}
+		})
+	}
+}
+
+func TestUpdateCannotTransferOwnershipToAnotherRouter(t *testing.T) {
+	f := newFakeAPI(t, dummy(map[string]any{"mtu": "1400"}), nil)
+	r := resourceFixture(f.server.URL)
+	old := modelState(t, testModel("https://old-router", "set interfaces dummy dum99 mtu 1400"))
+	ps := modelState(t, testModel(f.server.URL))
+	resp := resource.UpdateResponse{State: old}
+	r.Update(context.Background(), resource.UpdateRequest{State: old, Plan: tfsdk.Plan{Schema: ps.Schema, Raw: ps.Raw}}, &resp)
+	if !resp.Diagnostics.HasError() || f.reads != 0 || len(f.batches) != 0 || !resp.State.Raw.Equal(old.Raw) {
+		t.Fatal("update reused another router's ownership")
+	}
+	req := resource.ModifyPlanRequest{State: old, Config: tfsdk.Config{Schema: ps.Schema, Raw: ps.Raw}, Plan: tfsdk.Plan{Schema: ps.Schema, Raw: ps.Raw}}
+	preview := resource.ModifyPlanResponse{Plan: req.Plan}
+	r.ModifyPlan(context.Background(), req, &preview)
+	if preview.Diagnostics.HasError() || len(preview.RequiresReplace) == 0 || f.reads != 0 {
+		t.Fatal("replacement preview inspected new router with old ownership")
+	}
+}
+
+func TestAmbiguousSnapshotStopsApplyBeforeMutation(t *testing.T) {
+	raw := `set interfaces dummy dum99 description 'hello\nworld'`
+	f := newFakeAPI(t, dummy(map[string]any{"description": `hello\nworld`}), map[string]any{})
+	r := resourceFixture(f.server.URL)
+	old := modelState(t, testModel(f.server.URL, raw))
+	ps := modelState(t, testModel(f.server.URL))
+	resp := resource.UpdateResponse{State: old}
+	r.Update(context.Background(), resource.UpdateRequest{State: old, Plan: tfsdk.Plan{Schema: ps.Schema, Raw: ps.Raw}}, &resp)
+	if !resp.Diagnostics.HasError() || len(f.batches) != 0 || f.saves != 0 || !resp.State.Raw.Equal(old.Raw) {
+		t.Fatal("ambiguous snapshot allowed mutation or changed ownership state")
+	}
+}

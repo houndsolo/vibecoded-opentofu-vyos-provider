@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
 )
 
 // VyOS json_ast preserves node/value boundaries, empty containers and comments.
@@ -15,10 +16,11 @@ type configNode struct {
 	Children *[]configNode `json:"children"`
 }
 type nodeData struct {
-	Values  *[]string `json:"values"`
-	Comment *string   `json:"comment"`
-	Tag     *bool     `json:"tag"`
-	Leaf    *bool     `json:"leaf"`
+	Values     *[]string       `json:"values"`
+	RawComment json.RawMessage `json:"comment"`
+	Comment    *string         `json:"-"`
+	Tag        *bool           `json:"tag"`
+	Leaf       *bool           `json:"leaf"`
 }
 
 type Snapshot struct {
@@ -41,6 +43,11 @@ func DecodeSnapshot(raw []byte) (*Snapshot, error) {
 	walk = func(n *configNode, path []string) error {
 		if n.Name == nil || n.Data == nil || n.Children == nil || n.Data.Values == nil || n.Data.Leaf == nil || n.Data.Tag == nil {
 			return fmt.Errorf("incomplete VyOS json_ast node; refusing to infer ownership")
+		}
+		// JSON null explicitly means no comment. An omitted field does not:
+		// incomplete metadata must never authorize deletion of an unmanaged comment.
+		if len(n.Data.RawComment) == 0 || json.Unmarshal(n.Data.RawComment, &n.Data.Comment) != nil {
+			return fmt.Errorf("missing or invalid VyOS json_ast comment metadata")
 		}
 		if len(path) == 0 && *n.Name != "" {
 			return fmt.Errorf("expected the full VyOS configuration root")
@@ -110,6 +117,9 @@ func (s *Snapshot) VerifyActive(text string) error {
 	seen := map[string]bool{}
 	comments := map[string]string{}
 	for _, record := range configurationRecords(text) {
+		if err := validateActiveQuoting(record); err != nil {
+			return err
+		}
 		tokens, err := tokenize(record)
 		if err != nil || len(tokens) < 2 {
 			return fmt.Errorf("cannot parse active configuration export")
@@ -142,6 +152,46 @@ func (s *Snapshot) VerifyActive(text string) error {
 		n := s.nodes[pathKey(path)]
 		if n.Data.Comment != nil && *n.Data.Comment != "" && comments[pathKey(path)] != *n.Data.Comment {
 			return fmt.Errorf("REST session and active comments disagree")
+		}
+	}
+	return nil
+}
+
+// VyOS's native command renderer wraps values in single quotes but applies
+// configuration-string escapes, not POSIX escapes. It can also leave embedded
+// apostrophes unescaped. For example, a native newline exported as '\n' would
+// otherwise compare equal to a *different* pending value containing backslash-n.
+// Do not guess between these encodings: ownership checks must fail closed.
+// User-supplied commands retain the full tokenizer's quoting semantics.
+func validateActiveQuoting(record string) error {
+	var quote rune
+	runes := []rune(record)
+	ambiguous := func() error {
+		return fmt.Errorf("active configuration export has ambiguous quoting or escapes; cannot safely verify ownership against the REST session")
+	}
+	for i := 0; i < len(runes); i++ {
+		c := runes[i]
+		if c == '\\' {
+			if quote == '\'' {
+				return ambiguous()
+			}
+			i++
+			continue
+		}
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+				// Native exports quote only the final value. More tokens can be
+				// fragments of an apostrophe-containing value, not extra path nodes.
+				if strings.TrimSpace(string(runes[i+1:])) != "" {
+					return ambiguous()
+				}
+			}
+		} else if c == '\'' || c == '"' {
+			if i > 0 && !unicode.IsSpace(runes[i-1]) {
+				return ambiguous()
+			}
+			quote = c
 		}
 	}
 	return nil

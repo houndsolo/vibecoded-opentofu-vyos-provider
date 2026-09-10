@@ -203,7 +203,7 @@ func TestSnapshotAndComments(t *testing.T) {
 	if err != nil || len(batch.Operations) != 2 {
 		t.Fatalf("comment container pruned: %v %v", batch, err)
 	}
-	for _, raw := range []string{`{}`, `null`, `{"name":"","data":{},"children":[]}`, `{"name":"","data":{"values":[],"comment":null,"tag":false,"leaf":false},"children":[],"unexpected":true}`} {
+	for _, raw := range []string{`{}`, `null`, `{"name":"","data":{"values":[],"tag":false,"leaf":false},"children":[]}`, `{"name":"","data":{"values":[],"comment":false,"tag":false,"leaf":false},"children":[]}`, `{"name":"","data":{},"children":[]}`, `{"name":"","data":{"values":[],"comment":null,"tag":false,"leaf":false},"children":[],"unexpected":true}`} {
 		if _, err := DecodeSnapshot([]byte(raw)); err == nil {
 			t.Errorf("accepted unsafe AST %s", raw)
 		}
@@ -280,5 +280,34 @@ func TestCommentRemovalRequiresExplicitAuthorization(t *testing.T) {
 	batch, err := BuildBatch(s, owned, commandsFixture(t, []string{"delete interfaces dummy dum99 mtu"}))
 	if err != nil || !reflect.DeepEqual(opStrings(batch.Operations), []string{"delete interfaces dummy dum99 mtu"}) {
 		t.Fatalf("explicit authorization failed or expanded: %v %v", batch, err)
+	}
+}
+
+func TestActiveExportCannotConfuseNativeAndShellQuoting(t *testing.T) {
+	// Native VyOS export escapes newlines inside single quotes, and can leave
+	// embedded apostrophes literal. A POSIX tokenizer can turn either export
+	// into a different value that matches a pending REST-session AST.
+	for _, tc := range []struct{ pending, active string }{
+		{`hello\nworld`, `set interfaces dummy dum99 description 'hello\nworld'`},
+		{"abc", `set interfaces dummy dum99 description 'a'b'c'`},
+		{`say \"hello\"`, `set interfaces dummy dum99 description 'say \"hello\"'`},
+	} {
+		s := snapshotFixture(t, dummy(map[string]any{"description": tc.pending}))
+		if err := s.VerifyActive(tc.active + "\n"); err == nil {
+			t.Fatal("ambiguous native export was accepted as matching a different pending value")
+		}
+	}
+}
+
+func TestSnapshotRequiresCommentMetadataOnEveryNode(t *testing.T) {
+	root := fixtureAST("", dummy(map[string]any{"mtu": "1400"})).(map[string]any)
+	interfaces := root["children"].([]any)[0].(map[string]any)
+	delete(interfaces["data"].(map[string]any), "comment")
+	raw, err := json.Marshal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeSnapshot(raw); err == nil {
+		t.Fatal("omitted comment metadata could authorize pruning unmanaged comments")
 	}
 }

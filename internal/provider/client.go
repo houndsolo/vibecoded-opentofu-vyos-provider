@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -27,10 +28,35 @@ func normalizeEndpoint(endpoint string) (string, error) {
 	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return "", fmt.Errorf("endpoint must not contain credentials, a query, or a fragment")
 	}
-	u.Host = strings.ToLower(u.Host)
-	u.Path = strings.TrimRight(u.Path, "/")
-	u.RawPath = ""
-	return strings.TrimRight(u.String(), "/"), nil
+	host := u.Hostname()
+	// DNS is case-insensitive, but an IPv6 zone identifies a local interface
+	// whose name can be case-sensitive.
+	if zone := strings.IndexByte(host, '%'); zone >= 0 {
+		host = strings.ToLower(host[:zone]) + host[zone:]
+	} else {
+		host = strings.ToLower(host)
+	}
+	port := u.Port()
+	if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+		port = ""
+	}
+	u.Host = host
+	if port != "" {
+		u.Host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		u.Host = "[" + host + "]"
+	}
+	// Trim actual URL separators, never escaped slashes in a proxy route.
+	// Clearing RawPath can silently select a different router behind a proxy.
+	u.RawPath = strings.TrimRight(u.EscapedPath(), "/")
+	u.Path, _ = url.PathUnescape(u.RawPath)
+	return u.String(), nil
+}
+
+func sameEndpoint(a, b string) bool {
+	left, leftErr := normalizeEndpoint(a)
+	right, rightErr := normalizeEndpoint(b)
+	return leftErr == nil && rightErr == nil && left == right
 }
 
 func newClient(endpoint, apiKey string, insecure bool, timeout time.Duration) (*Client, error) {

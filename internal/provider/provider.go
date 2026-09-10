@@ -21,12 +21,13 @@ type providerModel struct {
 	PlanTimeout    types.String `tfsdk:"plan_timeout"`
 }
 type settings struct {
-	endpoint       string
-	apiKey         string
-	insecure       bool
-	requestTimeout time.Duration
-	planTimeout    time.Duration
-	unknown        bool
+	endpoint        string
+	endpointUnknown bool
+	apiKey          string
+	insecure        bool
+	requestTimeout  time.Duration
+	planTimeout     time.Duration
+	unknown         bool
 }
 
 var _ provider.Provider = &Provider{}
@@ -53,12 +54,20 @@ func (p *Provider) Configure(ctx context.Context, req provider.ConfigureRequest,
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	s := &settings{endpoint: os.Getenv("VYOS_ENDPOINT"), apiKey: os.Getenv("VYOS_API_KEY"), requestTimeout: 120 * time.Second, planTimeout: 5 * time.Second}
-	s.unknown = model.Endpoint.IsUnknown() || model.APIKey.IsUnknown() || model.Insecure.IsUnknown() || model.RequestTimeout.IsUnknown() || model.PlanTimeout.IsUnknown()
-	if !model.Endpoint.IsNull() && !model.Endpoint.IsUnknown() {
+	s := &settings{requestTimeout: 120 * time.Second, planTimeout: 5 * time.Second}
+	// Unknown explicit values must not fall back to an environment value from
+	// another router. An unknown default endpoint does not block resource targets
+	// that are already known, including targets retained in state for destroy.
+	s.endpointUnknown = model.Endpoint.IsUnknown()
+	s.unknown = model.APIKey.IsUnknown() || model.Insecure.IsUnknown() || model.RequestTimeout.IsUnknown()
+	if model.Endpoint.IsNull() {
+		s.endpoint = os.Getenv("VYOS_ENDPOINT")
+	} else if !model.Endpoint.IsUnknown() {
 		s.endpoint = model.Endpoint.ValueString()
 	}
-	if !model.APIKey.IsNull() && !model.APIKey.IsUnknown() {
+	if model.APIKey.IsNull() {
+		s.apiKey = os.Getenv("VYOS_API_KEY")
+	} else if !model.APIKey.IsUnknown() {
 		s.apiKey = model.APIKey.ValueString()
 	}
 	s.insecure = model.Insecure.ValueBool()
