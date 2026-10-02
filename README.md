@@ -73,9 +73,14 @@ This model permits resource `for_each` without a provider alias per router.
 The provider supplies shared credentials, TLS policy and timeouts. Use aliases
 when those settings differ. Changing a resource's resolved endpoint requires
 replacement: the old router is cleaned up before the new router is configured.
+Changes to hostname case, the explicit default port, or trailing URL separators
+keep the same target and ID. Resource endpoint spelling can still cause an
+in-place state update. Escaped slashes in proxy routes remain significant.
 The endpoint saved in state remains the target for refresh and destroy even if
-the provider default changes. Do not use `create_before_destroy` for overlapping
-configuration on the same router.
+the provider default changes or is not yet known. An explicit unknown provider
+endpoint does not use `VYOS_ENDPOINT` as a temporary fallback. A known resource
+endpoint can still be used in this case. Do not use `create_before_destroy` for
+overlapping configuration on the same router.
 
 ## Provider configuration
 
@@ -91,6 +96,9 @@ Explicit settings take precedence over environment variables. Prefer a trusted
 certificate and HTTPS. HTTP is accepted for local test servers or a trusted
 proxy; it sends the API key without transport encryption. URLs cannot contain
 user credentials, query parameters, or fragments. Redirects are rejected.
+If no endpoint is configured and no endpoint value is pending, plan reports a
+configuration error. An unreachable or not-yet-known endpoint still permits a
+best-effort plan.
 
 Enable the VyOS HTTPS REST API before apply. The key needs configuration read,
 configure, and save access. See the [VyOS API documentation](https://docs.vyos.io/en/rolling/automation/vyos-api.html).
@@ -168,9 +176,18 @@ Each snapshot also reads `/show` with `show configuration commands` and requires
 its SETs and comments to match the AST. The operational command reads the active
 configuration; the AST provides structural information. A pending API session,
 an incomplete export, or disagreement between the two reads causes an error.
-Quoted multiline values are parsed as complete commands. An unsupported export
-verb, such as a deactivation marker, also causes an error rather than being
-silently ignored.
+Quoted multiline values are parsed as complete commands. Native VyOS exports
+can use configuration-string escapes inside single quotes, and can leave
+embedded apostrophes unescaped. These are not equivalent to shell quoting.
+The provider rejects single-quoted backslashes and joined quoted segments in
+active exports because they can otherwise make different active and pending
+values appear equal. This can block a read or apply even when the affected value
+is unmanaged. Full support for these exports needs an unambiguous active
+configuration representation and tests against real VyOS versions. The user
+command tokenizer still supports its documented quoting rules.
+
+An unsupported export verb, such as a deactivation marker, also causes an error
+rather than being silently ignored.
 
 The snapshot contains every terminal SET path. A removed state command is
 eligible for deletion only if that **exact terminal assertion** still exists.

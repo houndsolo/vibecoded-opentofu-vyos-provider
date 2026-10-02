@@ -173,15 +173,18 @@ func (r *commandsResource) ModifyPlan(ctx context.Context, req resource.ModifyPl
 			return
 		}
 		if configured.IsNull() {
-			if r.settings != nil && r.settings.endpoint != "" {
+			if r.settings == nil || r.settings.endpointUnknown {
+				plan.Endpoint = types.StringUnknown()
+			} else if r.settings.endpoint != "" {
 				plan.Endpoint = types.StringValue(r.settings.endpoint)
 			} else {
-				plan.Endpoint = types.StringUnknown()
+				resp.Diagnostics.AddAttributeError(path.Root("endpoint"), "Missing router endpoint", "Set a resource endpoint, a provider endpoint, or VYOS_ENDPOINT.")
+				return
 			}
 		} else {
 			plan.Endpoint = configured
 		}
-		if !req.State.Raw.IsNull() && !plan.Endpoint.IsUnknown() && !plan.Endpoint.Equal(old.Endpoint) {
+		if !req.State.Raw.IsNull() && !plan.Endpoint.IsUnknown() && !sameEndpoint(plan.Endpoint.ValueString(), old.Endpoint.ValueString()) {
 			resp.RequiresReplace = append(resp.RequiresReplace, path.Root("endpoint"))
 		}
 		if commands, known := setStrings(plan.Commands); known {
@@ -201,7 +204,9 @@ func (r *commandsResource) ModifyPlan(ctx context.Context, req resource.ModifyPl
 	unavailable := func() {
 		tflog.Debug(ctx, "Exact VyOS operation preview unavailable; apply will recompute", map[string]any{"phase": "plan", "change": change, "resource": plan.Name.ValueString()})
 	}
-	if r.settings == nil {
+	// A replacement has two targets and two ownership scopes. Previewing it as
+	// an update would incorrectly use old-router ownership on the new router.
+	if r.settings == nil || len(resp.RequiresReplace) > 0 {
 		unavailable()
 		return
 	}
@@ -325,6 +330,10 @@ func (r *commandsResource) Delete(ctx context.Context, req resource.DeleteReques
 }
 
 func (r *commandsResource) apply(ctx context.Context, old, plan commandsModel, change string, state *tfsdk.State, diagnostics *diag.Diagnostics) {
+	if change == "update" && !sameEndpoint(old.Endpoint.ValueString(), plan.Endpoint.ValueString()) {
+		diagnostics.AddError("Router target changed during update", "The planned router differs from the stored target. Plan a resource replacement before applying; ownership cannot be transferred to another router by an update.")
+		return
+	}
 	c, err := r.client(plan)
 	if err != nil {
 		diagnostics.AddError("Cannot configure VyOS", err.Error())

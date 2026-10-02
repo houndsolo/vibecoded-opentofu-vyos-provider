@@ -145,7 +145,7 @@ def main():
                     raise AssertionError(f"{command}: exit {result.returncode}\n{result.stdout}\n{result.stderr}")
                 return result.stdout
 
-            def write(commands):
+            def write(commands, *, cosmetic_endpoint=False, unknown_default=False):
                 config = {
                     "terraform": {"required_providers": {"vyoscmd": {"source": "houndsolo/vyoscmd", "version": "0.1.0"}}},
                     "provider": {"vyoscmd": {}},
@@ -154,7 +154,16 @@ def main():
                         "vyoscmd_commands": {"router": {"name": "leaf-11", "endpoint": "${terraform_data.router.output}", "commands": commands}},
                     },
                 }
+                if cosmetic_endpoint:
+                    config["resource"]["vyoscmd_commands"]["router"]["endpoint"] += "/"
+                if unknown_default:
+                    config["resource"]["terraform_data"]["pending"] = {"input": f"http://127.0.0.1:{server.server_port}"}
+                    config["provider"]["vyoscmd"]["endpoint"] = "${terraform_data.pending.output}"
                 (root / "main.tf.json").write_text(json.dumps(config))
+
+            def resource_state():
+                resources = json.loads(run("show", "-json"))["values"]["root_module"]["resources"]
+                return next(r["values"] for r in resources if r["address"] == "vyoscmd_commands.router")
 
             commands = ["set interfaces dummy dum99 mtu 1400", "set interfaces dummy dum99 address 192.0.2.1/32", "set interfaces dummy dum99 address 192.0.2.2/32", "delete protocols ospf"]
             write(commands)
@@ -166,7 +175,18 @@ def main():
             run("apply", "-no-color", "create.plan")
             assert len(router.batches) == 1 and len(router.batches[0]) == 3
             run("plan", "-no-color", "-detailed-exitcode")
-            before_id = json.loads(run("show", "-json"))["values"]["root_module"]["resources"][1]["values"]["id"]
+            before_id = resource_state()["id"]
+            # A provider default that is not yet known must not block an
+            # existing resource with its own known target. A trailing slash
+            # change must update state without destroying owned configuration.
+            write(commands, cosmetic_endpoint=True, unknown_default=True)
+            run("plan", "-no-color", "-out=endpoint.plan", "-detailed-exitcode", code=2)
+            changes = json.loads(run("show", "-json", "endpoint.plan"))["resource_changes"]
+            change = next(c for c in changes if c["address"] == "vyoscmd_commands.router")
+            assert change["change"]["actions"] == ["update"], change
+            run("apply", "-no-color", "endpoint.plan")
+            assert len(router.batches) == 1 and resource_state()["id"] == before_id
+            run("plan", "-no-color", "-detailed-exitcode")
             with router.lock:
                 router.config["interfaces"]["dummy"]["dum99"]["mtu"] = "1420"
                 router.config["protocols"] = {"ospf": {}}
@@ -188,8 +208,7 @@ def main():
                 {"op": "set", "path": ["interfaces", "dummy", "dum99", "mtu", "1450"]},
             ]
             run("plan", "-no-color", "-detailed-exitcode")
-            resources = json.loads(run("show", "-json"))["values"]["root_module"]["resources"]
-            assert resources[1]["values"]["id"] == before_id
+            assert resource_state()["id"] == before_id
             # Remove a complete policy subtree without leaving an invalid rule.
             write(commands + ["set policy as-path-list TEST rule 10 action permit", "set policy as-path-list TEST rule 10 regex '^$'"])
             run("apply", "-auto-approve", "-no-color")
@@ -201,9 +220,9 @@ def main():
             run("destroy", "-auto-approve", "-no-color")
             assert router.config["interfaces"]["dummy"]["dum99"] == {"description": "UNMANAGED", "address": ["192.0.2.99/32"]}
             assert "ospf" in router.config["protocols"]
-            assert len(router.batches) == 6 and router.saves == 6
+            assert len(router.batches) == 6 and router.saves == 7
             assert "fixture-api-key" not in (root / "provider.log").read_text()
-            print(f"PASS: {run('version').splitlines()[0]}: create, no-op plan, SET/DELETE drift, saved-plan recomputation, pruning, destroy; six atomic batches")
+            print(f"PASS: {run('version').splitlines()[0]}: create, no-op plan, unknown provider default, cosmetic endpoint update, SET/DELETE drift, saved-plan recomputation, pruning, destroy; six atomic batches")
     finally:
         server.shutdown()
         server.server_close()

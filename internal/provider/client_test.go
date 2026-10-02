@@ -206,3 +206,37 @@ func TestRouterLock(t *testing.T) {
 	}
 	unlock()
 }
+
+func TestEndpointIdentityAndEscapedProxyPath(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{
+		{"https://ROUTER:443///", "https://router"},
+		{"http://ROUTER:80/", "http://router"},
+		{"https://ROUTER:8443/router%2Fleaf/", "https://router:8443/router%2Fleaf"},
+		{"https://router/leaf%2F", "https://router/leaf%2F"},
+		{"https://[2001:DB8::1]:443/", "https://[2001:db8::1]"},
+		{"https://[fe80::1%25ETH0]:443/", "https://[fe80::1%25ETH0]"},
+	} {
+		got, err := normalizeEndpoint(tc.input)
+		if err != nil || got != tc.want {
+			t.Errorf("%q: got %q, %v; want %q", tc.input, got, err, tc.want)
+		}
+	}
+	if sameEndpoint("https://router/leaf%2F1", "https://router/leaf/1") {
+		t.Fatal("distinct proxy routes have the same identity")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.RequestURI != "/router%2Fleaf/config-file" {
+			t.Errorf("request reached the wrong proxy route: %q", req.RequestURI)
+		}
+		_, _ = w.Write([]byte(`{"success":true,"data":null,"error":null}`))
+	}))
+	defer server.Close()
+	client, err := newClient(server.URL+"/router%2Fleaf/", "test-api-key", false, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.close()
+	if err := client.Save(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
